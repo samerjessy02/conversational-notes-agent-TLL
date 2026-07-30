@@ -129,11 +129,11 @@ class NoteDatabase:
 
 def make_seeded_db() -> NoteDatabase:
     db = NoteDatabase()
-    # db.add_note("Team Standup", "Agreed to move standup to Tuesdays at 10 AM.", ["meetings", "team"])
-    # db.add_note("Team Standup", "Meeting Tuesday", ["meetings", "team"])
-    # db.add_note("Team Standup", "Meeting Friday", ["meetings", "team"])
-    # db.add_note("API Redesign Notes", "Need to migrate endpoints from v1 REST to v2 GraphQL.", ["work", "api"])
-    # db.add_note("Old Office Address", "123 Main St, Suite 400, New York, NY", ["personal", "address"])
+    db.add_note("Team Standup", "Agreed to move standup to Tuesdays at 10 AM.", ["meetings", "team"])
+    db.add_note("Team Standup", "Meeting Tuesday", ["meetings", "team"])
+    db.add_note("Team Standup", "Meeting Friday", ["meetings", "team"])
+    db.add_note("API Redesign Notes", "Need to migrate endpoints from v1 REST to v2 GraphQL.", ["work", "api"])
+    db.add_note("Old Office Address", "123 Main St, Suite 400, New York, NY", ["personal", "address"])
     return db
 
 
