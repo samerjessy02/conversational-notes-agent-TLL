@@ -1,118 +1,104 @@
 # Conversational Note-Taking Agent
 
-## Files
+A small LangGraph agent that manages notes through chat: add, search, update,
+delete, all through natural language, backed by Groq for the LLM.
 
-| File | Purpose |
-|---|---|
-| `agent.py` | Everything shared: the mock DB, tools, intent classifier, system prompt, and the LangGraph workflow. Both entrypoints import `build_app()` from here. |
-| `main.py` | Original CLI, now a thin wrapper around `agent.py`. |
-| `ui.py` | New minimal Streamlit chat UI, with a per-reply "🔧 Tool calls & intent" panel for troubleshooting. |
-| `test_agent_smoke.py` | Scripted-LLM smoke test proving the confirmation flow and intent classifier actually work, without needing a real API key. |
+## Project layout
+
+```
+agent.py               core logic: DB, tools, intent classifier, graph
+main.py                CLI entrypoint
+ui.py                  Streamlit chat UI with a debug/trace panel
+test_agent_smoke.py    smoke test using a stubbed LLM (no API key needed)
+requirements.txt
+```
+
+`agent.py` is the only file that actually matters architecturally — both
+`main.py` and `ui.py` just call `build_app()` from it and drive the graph.
+
+## How it's put together
+
+**The database** is an in-memory dict (`NoteDatabase`) — no persistence, it
+resets every time you restart. Fine for a demo, would need to be swapped for
+something like SQLite if this ever needed to survive a restart.
+
+**Tools** wrap the database for the LLM: `add_note`, `search_notes`,
+`modify_note`, `delete_note`. The two destructive ones don't actually touch
+the database. They look up the note, describe what would change, and stash
+that proposal into the graph's state. Nothing gets deleted or edited at that
+point — it's just a pending action sitting in state.
+
+**The confirmation step is not something the LLM controls.** Earlier versions
+of this had a `confirmed: bool` argument the model itself was responsible
+for setting correctly, which is a fragile thing to rely on — a model can
+just set it to `True` on the first call, or mix up which note it's
+confirming. Instead there's a separate graph node,
+`execute_confirmation_node`, and it's the only code path that ever writes to
+the database for a modify/delete. The graph only routes there when a plain
+"yes" or "no" is detected in the user's next message — that detection is a
+regex, not a model call, so it can't be talked out of it.
+
+**The intent classifier** (`classify_intent`) is also just regex/keyword
+matching — it tags each message as create / search / modify / delete /
+confirm_yes / confirm_no / chitchat. For the first four it's just a hint
+added to the system prompt, the model can ignore it. For confirm_yes /
+confirm_no it's load-bearing: that's what triggers the deterministic
+execution path above. It's deliberately simple rather than a second LLM
+call — instant, free, and you can see exactly why it classified something
+a certain way in the UI's trace panel.
+
+**Graph flow**, roughly:
+
+```
+classify_intent → (confirm_yes/no + something pending?) → execute_confirmation → end
+                → (anything else) → agent → tool call? → tools → back to agent → end
+```
 
 ## Running it
 
-```bash
-pip install -r requirements.txt
+Using `uv`:
 
-# .env or exported:
+```bash
+uv venv
+uv pip install -r requirements.txt
+```
+
+Add your Groq key — either export it or drop a `.env` file in the project
+root:
+
+```
 GROQ_API_KEY=your_key_here
-
-python main.py           # CLI
-streamlit run ui.py      # Web UI
 ```
 
-Run the smoke test any time (no API key needed, it stubs the LLM):
+Then run whichever entrypoint you want:
 
 ```bash
-python test_agent_smoke.py
+uv run python main.py              # terminal chat
+uv run streamlit run ui.py         # browser chat with a tool-call trace panel
+uv run python test_agent_smoke.py  # sanity check, no API key required
 ```
 
-## What changed from your version, and why
+If you're not using `uv`, the equivalent is a normal venv + `pip install -r
+requirements.txt`, then `python main.py` / `streamlit run ui.py`.
 
-### 1. Intent classifier
-`classify_intent()` in `agent.py` is a small, fast, regex/keyword classifier
-that tags every user message as `create` / `search` / `modify` / `delete` /
-`confirm_yes` / `confirm_no` / `chitchat`. It's deliberately rule-based
-rather than a second LLM call — free, instant, and its output is directly
-visible in the UI's trace panel, which makes misroutes easy to debug. It's
-used two ways:
+## The UI
 
-- As a **hint** appended to the system prompt for create/search/modify/delete
-  (the LLM can still override it — it's guidance, not a hard constraint).
-- As a **hard routing decision** for `confirm_yes` / `confirm_no` — see below.
+`streamlit run ui.py` gives you a plain chat box. Under each reply there's a
+"Tool calls & intent" expander showing what got classified and which tool
+was actually called with which arguments — useful when something doesn't do
+what you expected and you want to know whether it's a search problem, a
+routing problem, or the model just picked the wrong tool. The sidebar also
+has a live dump of the notes currently in memory and a reset button.
 
-### 2. Confirmation is now enforced in code, not trusted to the LLM
-This was the main structural risk in the original version. `modify_note_tool`
-and `delete_note_tool` took a `confirmed: bool` argument that the *model
-itself* supplied — nothing stopped the model from sending `confirmed=True`
-on the very first call, or from confirming the wrong note if a fast/small
-tool-calling model got two turns crossed.
+It's single-session by design (one fixed thread id, one shared in-memory
+DB) — good for testing locally, not built for multiple concurrent users.
 
-Now:
-- `modify_note_tool` / `delete_note_tool` **never touch the database**. They
-  only look up the note and stage the proposed change into graph state
-  (`pending_confirmation`) via a `Command` update, then return a
-  `REQUIRES_CONFIRMATION` message.
-- The **only** place a mutation actually happens is `execute_confirmation_node`
-  in the graph, and the graph only reaches that node when `classify_intent()`
-  deterministically reads "yes" or "no" from the user's *own next message* —
-  the LLM is never asked to decide whether something is confirmed.
-- There's no `confirmed` field anywhere for the model to set.
+## Known gaps
 
-This means a destructive action always requires: propose (by tool call) →
-a literal yes/no from the human → then, and only then, code that isn't an
-LLM call touches the DB.
-
-### 3. Bug fix: truthy checks in the confirmation summary
-The original used `if title:` / `if tags:` when building the "proposed
-changes" description, so intentionally clearing a field to `""` or `[]`
-wouldn't show up as a change. Fixed to `is not None`.
-
-### 4. Clear startup error
-Missing `GROQ_API_KEY` now raises a readable error (`RuntimeError` in the
-CLI, `st.error` in the UI) instead of a confusing stack trace on the first
-LLM call.
-
-### 5. Shared `agent.py`
-DB/tools/graph were pulled out of `main.py` into `agent.py` so the CLI and
-the new UI don't maintain two copies of the same logic.
-
-## Minimal UI
-
-`streamlit run ui.py` gives you:
-- A plain chat interface.
-- A sidebar toggle to show/hide the debug trace, a "Reset conversation"
-  button, and a live dump of the current notes in the mock DB.
-- Under each assistant reply, an expandable **"🔧 Tool calls & intent"**
-  panel showing the classified intent, every tool call made that turn (name
-  + args), and the raw tool result string — this is the "what actually
-  happened" view for troubleshooting search misses, wrong note IDs, etc.
-
-It's intentionally single-file and has no auth, no persistence beyond the
-in-memory DB, and one shared conversation thread (`thread_id="ui-session"`)
-— fine for local debugging, not for multiple concurrent users.
-
-## Test cases
-
-**Happy path**
-- "Add a note titled 'Groceries', body 'milk, eggs', tag shopping" → created, no confirmation needed.
-- "What did I write about the API?" → finds the API Redesign note.
-- "Show my meeting notes" → tag-based or keyword search, depending on phrasing.
-- "Update my standup note to say Wednesdays" → since 3 notes share the title "Team Standup", expect the agent to search, find multiple matches, and ask which one before proposing anything.
-- "Delete the note about the old office address" → search finds it → proposes deletion → reply "yes" → deleted. Check the sidebar note list updates.
-- Reply "no" to a proposed deletion/modification → nothing changes, `pending_confirmation` clears (visible in the trace panel as no further tool calls).
-
-**Edge cases worth checking**
-- **Ambiguous target**: "delete my standup note" with 3 same-titled notes — the agent should list IDs and ask, not guess. If it doesn't, that's a system-prompt tuning issue, not a graph bug (the graph won't let a delete through without an explicit note_id anyway).
-- **Bare "yes" with nothing pending**: send "yes" with no prior proposal — should fall through to the normal agent path and just get a conversational reply, not crash.
-- **Non-existent note**: "delete note 999" — tool returns `ERROR: Note #999 does not exist.` before anything is staged; confirming "yes" afterward should say there's nothing pending (since no `pending_confirmation` was ever set).
-- **Confirmation phrased conversationally**: "yeah, go ahead" / "nah, don't" — should still resolve to confirm_yes/confirm_no (covered in `test_agent_smoke.py`).
-- **Long sentence containing a yes/no word**: "no, delete note 3 instead" — the classifier gates yes/no detection to short replies (≤6 words) specifically so this doesn't get misread as a bare rejection; it should fall through to `delete` intent.
-- **Race between two pending confirmations**: propose a delete, then before confirming, ask to modify a *different* note — the second proposal overwrites `pending_confirmation`, so a later "yes" applies to the second one only. Worth deciding if you want stacked/queued confirmations instead; current behavior is last-proposal-wins.
-- **Search with relative time**: "what did I add last week" — the temporal-word stripping regex should leave just meaningful keywords; if the query becomes empty (e.g., user says only "yesterday"), it degenerates to `tag`-only or "list everything," worth checking that isn't confusing to the model.
-- **Empty title**: "add a note with no title" — `add_note_tool` returns an explicit `ERROR: Title cannot be empty.` rather than silently creating a blank-titled note.
-
-## Known limitations (didn't fix, flagging for visibility)
-- Notes are still in-memory only (reset on restart) — fine for a demo, not for production. If you want this to survive restarts, the DB layer is the only thing that would need to change (swap `NoteDatabase` for a SQLite-backed repository with the same method signatures).
-- The UI uses one global `db` and one fixed `thread_id`, so it's single-user/single-session by design.
-- The intent classifier is a heuristic, not a model — it will misfire on unusual phrasing. It's a *hint* everywhere except the yes/no confirmation gate, which is the one place correctness actually matters, and that's the part the smoke test covers.
+- No persistence — restarting wipes the notes.
+- The intent classifier is a heuristic and will get phrasing it hasn't seen
+  wrong sometimes. That's acceptable everywhere except the yes/no
+  confirmation check, which is why that specific case has a smoke test.
+- If two destructive actions get proposed back to back before either is
+  confirmed, the second proposal just overwrites the first — there's no
+  queue.
