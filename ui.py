@@ -33,6 +33,7 @@ if "history" not in st.session_state:
 
 st.title("🗒️ Note-Taking Agent")
 st.caption('Try: "add a note about groceries", "what did I write about the API?", "delete the office note"')
+st.sidebar.caption(f"Notes DB: `{db.db_path}` (persists across restarts)")
 
 show_debug = st.sidebar.checkbox("Show tool-call trace under each reply", value=True)
 if st.sidebar.button("Reset conversation"):
@@ -40,12 +41,23 @@ if st.sidebar.button("Reset conversation"):
     get_app.clear()
     st.rerun()
 
-with st.sidebar.expander("📋 Current notes (debug)"):
-    if db.notes:
-        for n in db.notes.values():
+with st.sidebar.expander("📋 Current notes (debug)", expanded=False):
+    notes = db.search_notes()
+    if notes:
+        for n in notes:
             st.markdown(f"**#{n['id']} {n['title']}** — _{', '.join(n['tags']) or 'no tags'}_")
     else:
         st.caption("No notes.")
+
+with st.sidebar.expander("⏳ Pending confirmations (debug)", expanded=False):
+    snapshot = app.get_state(CONFIG)
+    pending = (snapshot.values.get("pending_confirmations") or []) if snapshot.values else []
+    if pending:
+        for i, p in enumerate(reversed(pending)):
+            marker = "next to resolve" if i == 0 else "queued"
+            st.markdown(f"- `{p['tool']}` on #{p['note_id']} ({marker}): {p['summary']}")
+    else:
+        st.caption("Nothing pending.")
 
 
 def render_trace(trace: dict) -> None:
