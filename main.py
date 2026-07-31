@@ -1,4 +1,5 @@
 from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.types import Command
 
 from agent import build_app
 
@@ -22,11 +23,20 @@ def main():
                 print("Goodbye!")
                 break
 
-            input_state = {"messages": [HumanMessage(content=user_input)]}
+            result = app.invoke({"messages": [HumanMessage(content=user_input)]}, config=config)
 
-            for event in app.stream(input_state, config=config, stream_mode="values"):
-                last_msg = event["messages"][-1]
+            # A destructive tool call pauses the graph via interrupt(). Prompt
+            # for y/n right here and resume -- nothing runs until we do.
+            while "__interrupt__" in result:
+                payload = result["__interrupt__"][0].value
+                print("\n[CONFIRM]")
+                for change in payload["changes"]:
+                    print(f"  - {change['summary']}")
+                answer = input("Proceed? (yes/no): ").strip().lower()
+                approved = answer in ("y", "yes")
+                result = app.invoke(Command(resume={"approved": approved}), config=config)
 
+            last_msg = result["messages"][-1]
             if isinstance(last_msg, AIMessage) and last_msg.content:
                 print(f"\nAgent: {last_msg.content}")
 

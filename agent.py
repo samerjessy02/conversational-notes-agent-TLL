@@ -6,29 +6,38 @@ there's exactly one implementation instead of two copies drifting apart.
 
 DESIGN NOTES (read this before touching the graph)
 ----------------------------------------------------------------------------
-1. Confirmation is enforced in CODE, not trusted to the LLM. modify_note_tool
-   and delete_note_tool never mutate the database. They only look up the
-   note and *stage* a proposed change into graph state. The only place a
-   mutation actually happens is execute_confirmation_node, and the graph
-   only reaches that node when classify_intent() has deterministically read
-   a plain "yes"/"no" off the user's own next message. The LLM is not part
-   of the confirmation-authority path.
+1. Confirmation is a real human-in-the-loop pause, not text parsing. When
+   the agent proposes a modify_note/delete_note call, the graph routes to
+   human_review_node, which calls LangGraph's interrupt(). This freezes
+   execution -- app.invoke() returns immediately with a `__interrupt__` key
+   and a structured payload describing exactly what would change. Nothing
+   runs until the caller resumes with Command(resume={"approved": bool}).
+   The CLI prompts for y/n; the Streamlit UI renders actual Yes/No buttons.
+   Either way, the decision is a boolean the caller supplies explicitly --
+   there's no "the model decided this looked like a yes" step anymore.
 
-2. Confirmations are queued, not single-slot. If the user (or the model,
-   mid-conversation) stages a second destructive action before responding
-   to the first, the first proposal is NOT silently discarded. Both live in
-   `pending_confirmations`, a list acting as a stack: the most recently
-   proposed action is the one a bare "yes"/"no" resolves (that's the
-   question that was most recently "asked"), and after resolving it, if
-   anything else is still queued, the reply says so and restates it.
-   Proposing the same (tool, note_id) again replaces the earlier entry in
-   place instead of queuing a duplicate.
+2. modify_note_tool and delete_note_tool mutate the database directly, same
+   as add_note_tool. That's safe now, specifically because by the time
+   ToolNode ever gets to run them, human_review_node has already gated the
+   call on interrupt()+approval. The tools themselves don't need to know
+   anything about confirmation -- the gate lives entirely in the graph's
+   routing, one level up.
 
-3. Notes persist in SQLite (default: notes.db in the working directory,
-   overridable via NOTES_DB_PATH). The seed data is only inserted the first
-   time the file is created/empty -- on every later startup, whatever's on
-   disk is used as-is, so notes survive a restart and the demo notes don't
-   get duplicated on every run.
+3. Because interrupt() genuinely blocks the graph, there's no need for a
+   confirmation queue anymore: the user (or the model) literally cannot
+   start a second turn while one destructive action is awaiting approval --
+   the graph is paused. The one edge case handled explicitly is a single
+   agent turn proposing MORE THAN ONE destructive tool call at once (e.g.
+   the model decides to delete note A and rename note B in the same
+   message): those are bundled into a single interrupt payload with a list
+   of changes, and approval/rejection applies to all of them together. This
+   keeps tool_call/tool_result ordering simple and avoids having to
+   reconstruct a partially-approved AIMessage (which is exactly the kind of
+   thing that trips up strict OpenAI-style tool-calling APIs like Groq's).
+
+4. Notes persist in SQLite (default: notes.db in the working directory,
+   overridable via NOTES_DB_PATH). Seed data is only inserted the first
+   time the file is created/empty.
 """
 import datetime
 import os
@@ -41,13 +50,13 @@ from typing_extensions import TypedDict
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import InjectedToolCallId, tool
+from langchain_core.tools import tool
 from langchain_groq import ChatGroq
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import InjectedState, ToolNode
-from langgraph.types import Command
+from langgraph.prebuilt import ToolNode
+from langgraph.types import interrupt
 
 load_dotenv()
 
@@ -62,8 +71,7 @@ class NoteDatabase:
     thread) with a lock around every statement. This app is a single-user
     CLI/Streamlit prototype, not a high-concurrency service, so a lock is
     simpler and safer than per-thread connections -- the latter would
-    silently give each thread its own isolated ":memory:" database, which
-    is exactly the kind of bug that's invisible until it isn't.
+    silently give each thread its own isolated ":memory:" database.
     """
 
     def __init__(self, db_path: str = "notes.db"):
@@ -165,9 +173,7 @@ def make_seeded_db(db_path: Optional[str] = None) -> NoteDatabase:
     don't wipe or duplicate data.
 
     Pass db_path=":memory:" explicitly for tests -- an isolated, throwaway
-    DB that never touches the real notes.db on disk. Tests must NOT rely on
-    the default path, since (a) it would persist mutations (like a delete)
-    across test runs, and (b) parallel test runs would collide on one file.
+    DB that never touches the real notes.db on disk.
     """
     if db_path is None:
         db_path = os.environ.get("NOTES_DB_PATH", "notes.db")
@@ -182,26 +188,22 @@ def make_seeded_db(db_path: Optional[str] = None) -> NoteDatabase:
 
 
 # =====================================================================
-# 2. INTENT CLASSIFIER
+# 2. INTENT CLASSIFIER (hint-only now -- confirmation no longer depends on it)
 # =====================================================================
-_YES_RE = re.compile(r"\b(yes|yeah|yep|yup|sure|confirm(ed)?|correct|go ahead|do it|okay|ok)\b", re.I)
-_NO_RE = re.compile(r"\b(no|nope|nah|cancel|don'?t|do not|stop|never ?mind)\b", re.I)
 _DELETE_RE = re.compile(r"\b(delete|remove|erase|trash|get rid of)\b", re.I)
 _MODIFY_RE = re.compile(r"\b(update|change|edit|modify|rename|correct|fix)\b", re.I)
 _CREATE_RE = re.compile(r"\b(add|create|new note|jot down|write down|save a note|note that|remember that)\b", re.I)
 _SEARCH_RE = re.compile(r"\b(find|search|show|list|display|what did i|look ?up|recall|any notes)\b", re.I)
 
-Intent = Literal["confirm_yes", "confirm_no", "delete", "modify", "create", "search", "chitchat"]
+Intent = Literal["delete", "modify", "create", "search", "chitchat"]
 
 
 def classify_intent(text: str) -> Intent:
-    """Cheap, deterministic, regex-based intent tag for a user message."""
+    """Cheap, deterministic, regex-based intent tag for a user message. Used
+    only as a soft hint injected into the system prompt -- the model can
+    ignore it. It is NOT involved in the confirmation flow anymore (see
+    human_review_node / interrupt() below for that)."""
     t = text.strip()
-    if len(t.split()) <= 6:
-        if _NO_RE.search(t):
-            return "confirm_no"
-        if _YES_RE.search(t):
-            return "confirm_yes"
     if _DELETE_RE.search(t):
         return "delete"
     if _MODIFY_RE.search(t):
@@ -230,24 +232,15 @@ _INTENT_HINTS = {
 # =====================================================================
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
-    pending_confirmations: List[Dict[str, Any]]
     last_intent: Optional[str]
-
-
-def _stage(queue: List[Dict[str, Any]], entry: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Push a proposal onto the confirmation queue. If a proposal already
-    exists for the same (tool, note_id), replace it in place rather than
-    stacking a duplicate -- e.g. the user asking to rename a note twice in a
-    row before confirming should update the pending change, not queue two
-    separate "rename note #3" confirmations."""
-    queue = [q for q in queue if not (q["tool"] == entry["tool"] and q["note_id"] == entry["note_id"])]
-    queue.append(entry)
-    return queue
 
 
 # =====================================================================
 # 4. TOOLS
 # =====================================================================
+DESTRUCTIVE_TOOLS = {"modify_note", "delete_note"}
+
+
 class AddNoteInput(BaseModel):
     title: str = Field(description="A concise, descriptive title for the note.")
     body: str = Field(description="The main text body of the note.")
@@ -300,74 +293,40 @@ def build_tools(db: NoteDatabase):
 
     @tool("modify_note", args_schema=ModifyNoteInput)
     def modify_note_tool(
-        note_id: int,
-        title: Optional[str] = None,
-        body: Optional[str] = None,
-        tags: Optional[List[str]] = None,
-        state: Annotated[Dict, InjectedState] = None,
-        tool_call_id: Annotated[str, InjectedToolCallId] = None,
-    ) -> Any:
-        """Propose a modification to an existing note's title, body, or tags.
-        This does NOT change anything yet -- it stages the change and the
-        system will ask the user to confirm on the next turn."""
-        note = db.get_note(note_id)
-        if not note:
+        note_id: int, title: Optional[str] = None, body: Optional[str] = None, tags: Optional[List[str]] = None
+    ) -> str:
+        """Modify an existing note's title, body, or tags. Only ever reached
+        AFTER the user has explicitly approved via the confirmation prompt --
+        this tool just applies the change."""
+        updated = db.modify_note(note_id, title=title, body=body, tags=tags)
+        if not updated:
             return f"ERROR: Note #{note_id} does not exist."
-
-        changes = []
-        if title is not None:
-            changes.append(f"Title -> '{title}'")
-        if body is not None:
-            changes.append(f"Body -> '{body}'")
-        if tags is not None:
-            changes.append(f"Tags -> {tags}")
-        change_desc = ", ".join(changes) if changes else "no changes specified"
-
-        msg = (
-            f"REQUIRES_CONFIRMATION: Target Note #{note_id} ('{note['title']}'). "
-            f"Proposed changes: [{change_desc}]. Ask the user to reply yes/no to confirm."
-        )
-        entry = {
-            "tool": "modify_note",
-            "note_id": note_id,
-            "title": title,
-            "body": body,
-            "tags": tags,
-            "summary": f"update note #{note_id} ('{note['title']}'): {change_desc}",
-        }
-        queue = _stage(list((state or {}).get("pending_confirmations") or []), entry)
-        return Command(
-            update={"messages": [ToolMessage(content=msg, tool_call_id=tool_call_id)], "pending_confirmations": queue}
-        )
+        return f"SUCCESS: Note #{note_id} ('{updated['title']}') updated."
 
     @tool("delete_note", args_schema=DeleteNoteInput)
-    def delete_note_tool(
-        note_id: int,
-        state: Annotated[Dict, InjectedState] = None,
-        tool_call_id: Annotated[str, InjectedToolCallId] = None,
-    ) -> Any:
-        """Propose deleting a note permanently. This does NOT delete anything
-        yet -- it stages the deletion and the system will ask the user to
-        confirm on the next turn."""
+    def delete_note_tool(note_id: int) -> str:
+        """Delete a note permanently. Only ever reached AFTER the user has
+        explicitly approved via the confirmation prompt."""
         note = db.get_note(note_id)
         if not note:
             return f"ERROR: Note #{note_id} does not exist."
-
-        msg = (
-            f"REQUIRES_CONFIRMATION: Delete Note #{note_id} ('{note['title']}') permanently? "
-            "Ask the user to reply yes/no to confirm."
-        )
-        entry = {
-            "tool": "delete_note",
-            "note_id": note_id,
-            "summary": f"delete note #{note_id} ('{note['title']}')",
-        }
-        queue = _stage(list((state or {}).get("pending_confirmations") or []), entry)
-        return Command(
-            update={"messages": [ToolMessage(content=msg, tool_call_id=tool_call_id)], "pending_confirmations": queue}
-        )
+        db.delete_note(note_id)
+        return f"SUCCESS: Note #{note_id} ('{note['title']}') deleted permanently."
 
     return [add_note_tool, search_notes_tool, modify_note_tool, delete_note_tool]
+
+
+def _describe_change(tool_name: str, args: Dict[str, Any], note: Optional[Dict[str, Any]]) -> str:
+    if not note:
+        return f"Note #{args.get('note_id')} was not found (it may already be deleted)."
+    if tool_name == "delete_note":
+        return f"Delete note #{note['id']} (\"{note['title']}\") permanently? This cannot be undone."
+    changes = []
+    for field in ("title", "body", "tags"):
+        if args.get(field) is not None:
+            changes.append(f"{field}: {note[field]!r} -> {args[field]!r}")
+    change_str = "; ".join(changes) if changes else "(no field changes specified)"
+    return f"Update note #{note['id']} (\"{note['title']}\")? {change_str}"
 
 
 # =====================================================================
@@ -384,11 +343,10 @@ MODIFICATION / DELETION RULES
 Always search first if you don't already know the note's ID. Never guess a note.
 If multiple notes match, list them (ID + title) and ask the user which one they mean.
 Call modify_note / delete_note with the change you intend to make -- you do not
-need to ask for confirmation yourself or track any "confirmed" flag; the system
-automatically pauses after your tool call, asks the user yes/no, and only applies
-the change if they say yes. If you see a ToolMessage cancelling an action, just
-acknowledge it. If the user stages more than one change before confirming either,
-that's fine -- the system tracks all of them and resolves the most recent one first.
+need to ask for confirmation yourself. The system automatically pauses after your
+tool call and shows the user a Yes/No prompt; it only applies the change if they
+approve it. If you see a ToolMessage saying an action was cancelled, just
+acknowledge it and ask what they'd like to do instead.
 """
 
 
@@ -399,8 +357,12 @@ def build_app(db: Optional[NoteDatabase] = None, checkpointer=None, llm=None):
     """Build the compiled graph. `db`, `checkpointer`, and `llm` are all
     injectable so the CLI, the UI, and tests can each supply their own
     (e.g. tests can pass a fake llm instead of hitting the real Groq API,
-    and should always pass db=make_seeded_db(":memory:") for isolation).
+    and should always pass db=NoteDatabase(":memory:") for isolation).
     Returns (app, db).
+
+    A checkpointer is required for interrupt()/Command(resume=...) to work
+    at all -- it's how LangGraph knows where execution paused for a given
+    thread_id. Defaults to MemorySaver if not supplied.
     """
     if db is None:
         db = make_seeded_db()
@@ -420,84 +382,74 @@ def build_app(db: Optional[NoteDatabase] = None, checkpointer=None, llm=None):
         intent = classify_intent(last_human.content) if last_human else "chitchat"
         return {"last_intent": intent}
 
-    def route_after_classify(state: AgentState) -> Literal["execute_confirmation", "agent"]:
-        if state.get("last_intent") in ("confirm_yes", "confirm_no") and state.get("pending_confirmations"):
-            return "execute_confirmation"
-        return "agent"
-
-    def execute_confirmation_node(state: AgentState) -> Dict[str, Any]:
-        """The ONLY place a modify/delete is actually applied to the database.
-        Reached only via a deterministic yes/no classification, never via the
-        LLM deciding on its own that something is confirmed. Resolves the
-        most recently staged item (top of the stack) first."""
-        queue = list(state.get("pending_confirmations") or [])
-        if not queue:
-            return {"messages": [AIMessage(content="There's nothing pending to confirm.")]}
-
-        pending = queue.pop()  # most recently proposed = resolved first
-
-        if state["last_intent"] == "confirm_no":
-            reply = f"Okay, cancelled -- I won't {pending['summary']}."
-        elif pending["tool"] == "delete_note":
-            note = db.get_note(pending["note_id"])
-            if not note:
-                reply = f"Note #{pending['note_id']} no longer exists (already deleted?)."
-            else:
-                db.delete_note(pending["note_id"])
-                reply = f"Deleted note #{pending['note_id']} ('{note['title']}')."
-        elif pending["tool"] == "modify_note":
-            updated = db.modify_note(
-                pending["note_id"], title=pending.get("title"), body=pending.get("body"), tags=pending.get("tags")
-            )
-            reply = (
-                f"Updated note #{pending['note_id']} ('{updated['title']}')."
-                if updated
-                else f"Note #{pending['note_id']} no longer exists."
-            )
-        else:
-            reply = "There was nothing pending to confirm."
-
-        if queue:
-            next_item = queue[-1]
-            reply += f" You still have a pending action: {next_item['summary']}. Reply yes/no to handle that one too."
-
-        return {"messages": [AIMessage(content=reply)], "pending_confirmations": queue}
-
     def agent_node(state: AgentState) -> Dict[str, Any]:
         prompt = SYSTEM_PROMPT
         hint = _INTENT_HINTS.get(state.get("last_intent"))
         if hint:
             prompt += f"\n\n[Hint: {hint}]"
-        queue = state.get("pending_confirmations") or []
-        if queue:
-            prompt += (
-                f"\n\n[Note: there {'is' if len(queue) == 1 else 'are'} {len(queue)} pending unconfirmed "
-                f"action(s), most recent: {queue[-1]['summary']}. If the user's message isn't a clear "
-                "yes/no, ask them to clarify.]"
-            )
         messages = [SystemMessage(content=prompt)] + state["messages"]
         response = llm_with_tools.invoke(messages)
         return {"messages": [response]}
 
-    def route_after_agent(state: AgentState) -> Literal["tools", "__end__"]:
+    def route_after_agent(state: AgentState) -> Literal["human_review", "tools", "__end__"]:
         last = state["messages"][-1]
-        if isinstance(last, AIMessage) and last.tool_calls:
-            return "tools"
-        return END
+        if not (isinstance(last, AIMessage) and last.tool_calls):
+            return END
+        if any(tc["name"] in DESTRUCTIVE_TOOLS for tc in last.tool_calls):
+            return "human_review"
+        return "tools"
+
+    def human_review_node(state: AgentState) -> Dict[str, Any]:
+        """The ONLY place a modify/delete gets a chance to run. Pauses the
+        entire graph via interrupt() and waits for the caller (CLI prompt or
+        UI Yes/No buttons) to resume with an explicit approved: bool. If more
+        than one destructive tool call is in this turn, they're bundled into
+        one payload and approved/rejected together."""
+        last = state["messages"][-1]
+        destructive_calls = [tc for tc in last.tool_calls if tc["name"] in DESTRUCTIVE_TOOLS]
+
+        changes = []
+        for tc in destructive_calls:
+            note = db.get_note(tc["args"].get("note_id"))
+            changes.append(
+                {
+                    "tool": tc["name"],
+                    "note_id": tc["args"].get("note_id"),
+                    "summary": _describe_change(tc["name"], tc["args"], note),
+                }
+            )
+
+        decision = interrupt({"type": "confirmation_required", "changes": changes})
+        approved = bool(isinstance(decision, dict) and decision.get("approved"))
+
+        if approved:
+            return {}  # leave the AIMessage's tool_calls untouched; "tools" will run them for real
+
+        cancel_messages = [
+            ToolMessage(content="CANCELLED: user did not approve this action.", tool_call_id=tc["id"])
+            for tc in last.tool_calls
+        ]
+        return {"messages": cancel_messages}
+
+    def route_after_human_review(state: AgentState) -> Literal["tools", "agent"]:
+        last = state["messages"][-1]
+        if isinstance(last, ToolMessage) and last.content.startswith("CANCELLED"):
+            return "agent"
+        return "tools"
 
     workflow = StateGraph(AgentState)
     workflow.add_node("classify_intent", classify_intent_node)
     workflow.add_node("agent", agent_node)
     workflow.add_node("tools", ToolNode(tools))
-    workflow.add_node("execute_confirmation", execute_confirmation_node)
+    workflow.add_node("human_review", human_review_node)
 
     workflow.add_edge(START, "classify_intent")
+    workflow.add_edge("classify_intent", "agent")
     workflow.add_conditional_edges(
-        "classify_intent", route_after_classify, {"execute_confirmation": "execute_confirmation", "agent": "agent"}
+        "agent", route_after_agent, {"human_review": "human_review", "tools": "tools", END: END}
     )
-    workflow.add_conditional_edges("agent", route_after_agent, {"tools": "tools", END: END})
+    workflow.add_conditional_edges("human_review", route_after_human_review, {"tools": "tools", "agent": "agent"})
     workflow.add_edge("tools", "agent")
-    workflow.add_edge("execute_confirmation", END)
 
     if checkpointer is None:
         checkpointer = MemorySaver()

@@ -2,11 +2,10 @@
 Smoke tests using a scripted fake LLM (no API key needed) plus a couple of
 plain unit tests on the database. Run with:  python test_agent_smoke.py
 
-Every test that touches the graph uses db_path=":memory:" explicitly.
+Every test that touches the graph uses NoteDatabase(":memory:") explicitly.
 NEVER let a test use the default "notes.db" path -- it's meant to persist
 across real runs, so a test writing to it would corrupt state for the next
-run (this bit us once already: a delete during a test would silently
-survive to the next `python test_agent_smoke.py` invocation).
+run.
 """
 import os
 import tempfile
@@ -17,6 +16,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
 
 from agent import NoteDatabase, build_app, classify_intent, make_seeded_db
 
@@ -42,14 +42,20 @@ def tc(name, args):
     return {"name": name, "args": args, "id": f"call_{uuid.uuid4().hex[:8]}"}
 
 
+def seeded_memory_db() -> NoteDatabase:
+    db = NoteDatabase(":memory:")
+    db.add_note("Team Standup", "Agreed to move standup to Tuesdays at 10 AM.", ["meetings", "team"])
+    db.add_note("Team Standup", "Meeting Tuesday", ["meetings", "team"])
+    db.add_note("Team Standup", "Meeting Friday", ["meetings", "team"])
+    db.add_note("API Redesign Notes", "Need to migrate endpoints from v1 REST to v2 GraphQL.", ["work", "api"])
+    db.add_note("Old Office Address", "123 Main St, Suite 400, New York, NY", ["personal", "address"])
+    return db
+
+
 # --------------------------------------------------------------------- #
-# Intent classifier
+# Intent classifier (hint-only now)
 # --------------------------------------------------------------------- #
 def test_intent_classifier():
-    assert classify_intent("yes") == "confirm_yes"
-    assert classify_intent("Yeah go ahead") == "confirm_yes"
-    assert classify_intent("no") == "confirm_no"
-    assert classify_intent("nope, cancel that") == "confirm_no"
     assert classify_intent("delete the office note") == "delete"
     assert classify_intent("can you update my standup note") == "modify"
     assert classify_intent("add a note about groceries") == "create"
@@ -69,19 +75,16 @@ def test_persistence_across_reopen():
     db1.add_note("Sixth Note", "added after seeding", ["scratch"])
     assert len(db1.search_notes()) == 6
 
-    # Simulate a restart: open a brand new NoteDatabase pointed at the same file
-    db2 = make_seeded_db(tmp_path)
+    db2 = make_seeded_db(tmp_path)  # simulate a restart
     notes = db2.search_notes()
     assert len(notes) == 6, "reopening the same file must not lose the 6th note"
     assert any(n["title"] == "Sixth Note" for n in notes)
     print("PASS: notes survive closing and reopening the database file")
 
-    # And seeding must NOT run again on a non-empty file
     db3 = make_seeded_db(tmp_path)
     assert len(db3.search_notes()) == 6, "reopening a non-empty DB must not re-seed duplicates"
     print("PASS: reopening a non-empty DB does not duplicate the seed notes")
 
-    # A genuinely fresh path, on the other hand, should get freshly seeded
     tmp_path2 = os.path.join(tempfile.mkdtemp(), "other_notes.db")
     db4 = make_seeded_db(tmp_path2)
     assert len(db4.search_notes()) == 5
@@ -101,125 +104,118 @@ def test_delete_persists_across_reopen():
 
 
 # --------------------------------------------------------------------- #
-# Confirmation queue + graph flow
+# Human-in-the-loop confirmation via interrupt()/Command(resume=...)
 # --------------------------------------------------------------------- #
-def test_graph_flow_basic():
-    db = NoteDatabase(":memory:")
-    if db.is_empty():
-        db.add_note("Team Standup", "Agreed to move standup to Tuesdays at 10 AM.", ["meetings", "team"])
-        db.add_note("Team Standup", "Meeting Tuesday", ["meetings", "team"])
-        db.add_note("Team Standup", "Meeting Friday", ["meetings", "team"])
-        db.add_note("API Redesign Notes", "Need to migrate endpoints from v1 REST to v2 GraphQL.", ["work", "api"])
-        db.add_note("Old Office Address", "123 Main St, Suite 400, New York, NY", ["personal", "address"])
+def test_delete_requires_explicit_approval():
+    db = seeded_memory_db()
     assert db.get_note(5)["title"] == "Old Office Address"
 
     script = [
         AIMessage(content="", tool_calls=[tc("delete_note", {"note_id": 5})]),
-        AIMessage(content="Note #5 is staged for deletion. Confirm?"),
     ]
     llm = ScriptedChatModel(responses=script)
     app, db = build_app(db=db, llm=llm, checkpointer=MemorySaver())
     config = {"configurable": {"thread_id": "t1"}}
 
-    out = app.invoke({"messages": [HumanMessage(content="delete the old office address note")]}, config=config)
-    assert db.get_note(5) is not None, "tool must NOT delete on the proposing call"
-    assert len(out["pending_confirmations"]) == 1
-    assert out["pending_confirmations"][0]["tool"] == "delete_note"
-    assert out["pending_confirmations"][0]["note_id"] == 5
-    print("PASS: delete_note proposes without mutating the DB")
+    result = app.invoke({"messages": [HumanMessage(content="delete the old office address note")]}, config=config)
+    assert "__interrupt__" in result, "a destructive tool call must pause the graph"
+    assert db.get_note(5) is not None, "nothing may be deleted before approval"
+    payload = result["__interrupt__"][0].value
+    assert payload["changes"][0]["note_id"] == 5
+    assert "Old Office Address" in payload["changes"][0]["summary"]
+    print(f"PASS: delete_note pauses with a clear payload: {payload['changes'][0]['summary']!r}")
 
-    idx_before = llm.idx
-    out2 = app.invoke({"messages": [HumanMessage(content="no")]}, config=config)
-    assert llm.idx == idx_before, "confirm_no must bypass the LLM entirely"
-    assert out2["pending_confirmations"] == []
-    assert db.get_note(5) is not None
-    print(f"PASS: 'no' cancels deterministically without calling the LLM. Reply: {out2['messages'][-1].content!r}")
+    # Reject
+    llm.responses.append(AIMessage(content="Okay, I won't delete it."))
+    result2 = app.invoke(Command(resume={"approved": False}), config=config)
+    assert "__interrupt__" not in result2
+    assert db.get_note(5) is not None, "note must survive a rejected delete"
+    print(f"PASS: resuming with approved=False cancels cleanly. Reply: {result2['messages'][-1].content!r}")
 
+    # Re-propose then approve
     llm.responses += [
         AIMessage(content="", tool_calls=[tc("delete_note", {"note_id": 5})]),
-        AIMessage(content="Note #5 is staged for deletion again. Confirm?"),
     ]
-    out3 = app.invoke({"messages": [HumanMessage(content="actually delete it")]}, config=config)
-    assert len(out3["pending_confirmations"]) == 1
+    result3 = app.invoke({"messages": [HumanMessage(content="actually delete it")]}, config=config)
+    assert "__interrupt__" in result3
 
-    idx_before = llm.idx
-    out4 = app.invoke({"messages": [HumanMessage(content="yes")]}, config=config)
-    assert llm.idx == idx_before, "confirm_yes must bypass the LLM entirely"
-    assert db.get_note(5) is None, "note must actually be deleted after explicit yes"
-    assert out4["pending_confirmations"] == []
-    print(f"PASS: 'yes' actually deletes deterministically. Reply: {out4['messages'][-1].content!r}")
+    llm.responses.append(AIMessage(content="Done, it's deleted."))
+    result4 = app.invoke(Command(resume={"approved": True}), config=config)
+    assert "__interrupt__" not in result4
+    assert db.get_note(5) is None, "note must actually be deleted after explicit approval"
+    print(f"PASS: resuming with approved=True actually deletes. Reply: {result4['messages'][-1].content!r}")
 
 
-def test_confirmation_queue_stacking():
-    """Two destructive proposals stage before either is confirmed. A bare
-    'yes' should resolve the most recently proposed one first, and the
-    first one should still be waiting afterward -- not silently dropped."""
-    db = NoteDatabase(":memory:")
-    db.add_note("Note A", "body A", [])
-    db.add_note("Note B", "body B", [])
-
+def test_modify_requires_explicit_approval():
+    db = seeded_memory_db()
     script = [
-        AIMessage(content="", tool_calls=[tc("delete_note", {"note_id": 1})]),
-        AIMessage(content="Note #1 staged for deletion."),
-        AIMessage(content="", tool_calls=[tc("delete_note", {"note_id": 2})]),
-        AIMessage(content="Note #2 staged for deletion."),
+        AIMessage(content="", tool_calls=[tc("modify_note", {"note_id": 1, "title": "New Title"})]),
     ]
     llm = ScriptedChatModel(responses=script)
     app, db = build_app(db=db, llm=llm, checkpointer=MemorySaver())
     config = {"configurable": {"thread_id": "t2"}}
 
-    app.invoke({"messages": [HumanMessage(content="delete note A")]}, config=config)
-    out = app.invoke({"messages": [HumanMessage(content="delete note B too")]}, config=config)
-    assert len(out["pending_confirmations"]) == 2, "both proposals must be queued, not overwritten"
-    assert [p["note_id"] for p in out["pending_confirmations"]] == [1, 2]
-    print("PASS: a second proposal queues alongside the first instead of overwriting it")
+    result = app.invoke({"messages": [HumanMessage(content="rename note 1 to New Title")]}, config=config)
+    assert "__interrupt__" in result
+    assert db.get_note(1)["title"] != "New Title", "must not mutate before approval"
 
-    out2 = app.invoke({"messages": [HumanMessage(content="yes")]}, config=config)
-    assert db.get_note(2) is None, "the MOST RECENTLY proposed item (note B) resolves first"
-    assert db.get_note(1) is not None, "the earlier proposal (note A) must still be intact"
-    assert len(out2["pending_confirmations"]) == 1
-    assert "pending action" in out2["messages"][-1].content
-    print(f"PASS: 'yes' resolves the most recent proposal and flags the remaining one. Reply: {out2['messages'][-1].content!r}")
-
-    out3 = app.invoke({"messages": [HumanMessage(content="yes")]}, config=config)
-    assert db.get_note(1) is None
-    assert out3["pending_confirmations"] == []
-    print("PASS: a second 'yes' resolves the remaining queued item")
+    llm.responses.append(AIMessage(content="Renamed it."))
+    result2 = app.invoke(Command(resume={"approved": True}), config=config)
+    assert db.get_note(1)["title"] == "New Title", "must mutate after approval"
+    print("PASS: modify_note also gates on explicit approval before writing")
 
 
-def test_restage_same_note_replaces_not_duplicates():
-    """Proposing a change to the same note twice before confirming should
-    replace the pending entry, not create two queued confirmations for the
-    same note."""
-    db = NoteDatabase(":memory:")
-    db.add_note("Note A", "original body", [])
-
+def test_bundled_multi_change_turn_all_or_nothing():
+    """If the model proposes two destructive actions in the SAME turn, they
+    should be bundled into one confirmation payload and resolved together."""
+    db = seeded_memory_db()
     script = [
-        AIMessage(content="", tool_calls=[tc("modify_note", {"note_id": 1, "title": "First Rename"})]),
-        AIMessage(content="Staged."),
-        AIMessage(content="", tool_calls=[tc("modify_note", {"note_id": 1, "title": "Second Rename"})]),
-        AIMessage(content="Staged again."),
+        AIMessage(
+            content="",
+            tool_calls=[tc("delete_note", {"note_id": 1}), tc("delete_note", {"note_id": 2})],
+        ),
     ]
     llm = ScriptedChatModel(responses=script)
     app, db = build_app(db=db, llm=llm, checkpointer=MemorySaver())
     config = {"configurable": {"thread_id": "t3"}}
 
-    app.invoke({"messages": [HumanMessage(content="rename note 1 to First Rename")]}, config=config)
-    out = app.invoke({"messages": [HumanMessage(content="actually rename it to Second Rename instead")]}, config=config)
-    assert len(out["pending_confirmations"]) == 1, "re-proposing the same note must replace, not stack"
-    assert out["pending_confirmations"][0]["title"] == "Second Rename"
-    print("PASS: re-proposing a change to the same note replaces the pending entry")
+    result = app.invoke({"messages": [HumanMessage(content="delete the first two standup notes")]}, config=config)
+    assert "__interrupt__" in result
+    payload = result["__interrupt__"][0].value
+    assert len(payload["changes"]) == 2, "both proposed deletions must appear in one payload"
+    print(f"PASS: two destructive calls in one turn bundle into one confirmation ({len(payload['changes'])} changes)")
 
-    out2 = app.invoke({"messages": [HumanMessage(content="yes")]}, config=config)
-    assert db.get_note(1)["title"] == "Second Rename", "the LATEST proposal must be the one applied"
-    print("PASS: confirming applies the latest staged version, not a stale one")
+    llm.responses.append(AIMessage(content="Both deleted."))
+    result2 = app.invoke(Command(resume={"approved": True}), config=config)
+    assert db.get_note(1) is None and db.get_note(2) is None, "approving once must apply BOTH changes"
+    print("PASS: a single approval applies every bundled change")
+
+
+def test_rejecting_bundled_changes_applies_neither():
+    db = seeded_memory_db()
+    script = [
+        AIMessage(
+            content="",
+            tool_calls=[tc("delete_note", {"note_id": 1}), tc("delete_note", {"note_id": 2})],
+        ),
+    ]
+    llm = ScriptedChatModel(responses=script)
+    app, db = build_app(db=db, llm=llm, checkpointer=MemorySaver())
+    config = {"configurable": {"thread_id": "t4"}}
+
+    app.invoke({"messages": [HumanMessage(content="delete the first two standup notes")]}, config=config)
+    llm.responses.append(AIMessage(content="Okay, cancelled both."))
+    result = app.invoke(Command(resume={"approved": False}), config=config)
+    assert db.get_note(1) is not None and db.get_note(2) is not None, "rejecting once must cancel BOTH changes"
+    print("PASS: a single rejection cancels every bundled change, neither is applied")
 
 
 if __name__ == "__main__":
     test_intent_classifier()
     test_persistence_across_reopen()
     test_delete_persists_across_reopen()
-    test_graph_flow_basic()
-    test_confirmation_queue_stacking()
-    test_restage_same_note_replaces_not_duplicates()
+    test_delete_requires_explicit_approval()
+    test_modify_requires_explicit_approval()
+    test_bundled_multi_change_turn_all_or_nothing()
+    test_rejecting_bundled_changes_applies_neither()
     print("\nALL SMOKE TESTS PASSED")
