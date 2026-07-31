@@ -210,6 +210,43 @@ def test_rejecting_bundled_changes_applies_neither():
     print("PASS: a single rejection cancels every bundled change, neither is applied")
 
 
+def test_sequential_proposals_each_get_their_own_interrupt():
+    """Reproduces a real observed sequence: the model proposes deleting note
+    A, gets rejected, and on its OWN NEXT TURN (not bundled -- a separate
+    AIMessage) decides to propose deleting note B too. Note B's deletion
+    must require its own independent approval -- rejecting note A must
+    never implicitly grant or skip approval for note B."""
+    db = seeded_memory_db()
+    script = [
+        AIMessage(content="", tool_calls=[tc("delete_note", {"note_id": 4})]),
+        AIMessage(
+            content="Cancelled note #4. I'll delete note #5 as well.",
+            tool_calls=[tc("delete_note", {"note_id": 5})],
+        ),
+        AIMessage(content="Deleted note #5. Note #4 is untouched."),
+    ]
+    llm = ScriptedChatModel(responses=script)
+    app, db = build_app(db=db, llm=llm, checkpointer=MemorySaver())
+    config = {"configurable": {"thread_id": "t5"}}
+
+    r1 = app.invoke({"messages": [HumanMessage(content="delete the API note and the office note")]}, config=config)
+    assert "__interrupt__" in r1
+    assert r1["__interrupt__"][0].value["changes"][0]["note_id"] == 4
+
+    r2 = app.invoke(Command(resume={"approved": False}), config=config)
+    assert "__interrupt__" in r2, "the model's follow-up proposal must trigger its OWN interrupt"
+    assert r2["__interrupt__"][0].value["changes"][0]["note_id"] == 5
+    assert db.get_note(4) is not None, "rejecting note 4 must not affect it either way beyond cancelling"
+    assert db.get_note(5) is not None, "note 5 must NOT be deleted just because it was mentioned in the same reply"
+    print("PASS: a follow-up proposal after a rejection gets its own independent interrupt")
+
+    r3 = app.invoke(Command(resume={"approved": True}), config=config)
+    assert "__interrupt__" not in r3
+    assert db.get_note(4) is not None, "note 4 was rejected earlier and must still be untouched"
+    assert db.get_note(5) is None, "note 5 was separately approved and should now be deleted"
+    print("PASS: approving the second, independent interrupt only affects note 5, not note 4")
+
+
 if __name__ == "__main__":
     test_intent_classifier()
     test_persistence_across_reopen()
@@ -218,4 +255,5 @@ if __name__ == "__main__":
     test_modify_requires_explicit_approval()
     test_bundled_multi_change_turn_all_or_nothing()
     test_rejecting_bundled_changes_applies_neither()
+    test_sequential_proposals_each_get_their_own_interrupt()
     print("\nALL SMOKE TESTS PASSED")

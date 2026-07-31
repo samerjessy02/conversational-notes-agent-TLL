@@ -18,6 +18,7 @@ not a byte-exact string match.
 | `test_modify_requires_explicit_approval` | Same guarantee for `modify_note` |
 | `test_bundled_multi_change_turn_all_or_nothing` | Two destructive tool calls proposed in the same turn produce ONE confirmation payload with both changes listed; a single approval applies both |
 | `test_rejecting_bundled_changes_applies_neither` | A single rejection cancels both bundled changes, not just one |
+| `test_sequential_proposals_each_get_their_own_interrupt` | Reproduces an observed real sequence: model proposes deleting note A, gets rejected, then on its own next turn proposes deleting note B too — note B must get its own independent interrupt; rejecting A must not implicitly approve or skip B |
 
 Run it any time with `python test_agent_smoke.py` (or `uv run python
 test_agent_smoke.py`) — no API key required, it stubs the LLM.
