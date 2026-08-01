@@ -233,6 +233,13 @@ _INTENT_HINTS = {
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     last_intent: Optional[str]
+    rejected_this_turn: List[str]
+    # "tool:note_id" keys the user has already said no to since their last
+    # actual chat message. Scoped to "this turn" because it's reset in
+    # classify_intent_node, which only runs when a NEW HumanMessage arrives
+    # -- a resumed interrupt never passes back through it. This is what lets
+    # the user retry later by just asking again, while preventing the model
+    # from re-proposing the identical rejected change in a loop right now.
 
 
 # =====================================================================
@@ -395,7 +402,7 @@ def build_app(db: Optional[NoteDatabase] = None, checkpointer=None, llm=None):
     def classify_intent_node(state: AgentState) -> Dict[str, Any]:
         last_human = next((m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None)
         intent = classify_intent(last_human.content) if last_human else "chitchat"
-        return {"last_intent": intent}
+        return {"last_intent": intent, "rejected_this_turn": []}
 
     def agent_node(state: AgentState) -> Dict[str, Any]:
         prompt = SYSTEM_PROMPT
@@ -419,9 +426,38 @@ def build_app(db: Optional[NoteDatabase] = None, checkpointer=None, llm=None):
         entire graph via interrupt() and waits for the caller (CLI prompt or
         UI Yes/No buttons) to resume with an explicit approved: bool. If more
         than one destructive tool call is in this turn, they're bundled into
-        one payload and approved/rejected together."""
+        one payload and approved/rejected together.
+
+        Circuit breaker: if the model re-proposes the EXACT same (tool,
+        note_id) that was already rejected earlier in this turn, we do not
+        interrupt again -- we auto-cancel it and end the turn with a fixed
+        message, without going back through the LLM. This exists because
+        nothing guarantees a model accepts a rejection gracefully; a model
+        that keeps re-proposing after "no" would otherwise force the human
+        to keep clicking "No" indefinitely (observed in practice). Ending
+        the turn outright, rather than looping back to "agent", is what
+        actually guarantees termination -- looping back just gives the model
+        another chance to propose it again.
+        """
         last = state["messages"][-1]
         destructive_calls = [tc for tc in last.tool_calls if tc["name"] in DESTRUCTIVE_TOOLS]
+        already_rejected = set(state.get("rejected_this_turn") or [])
+        keys = [f"{tc['name']}:{tc['args'].get('note_id')}" for tc in destructive_calls]
+
+        if any(k in already_rejected for k in keys):
+            cancel_messages = [
+                ToolMessage(
+                    content="CANCELLED: this exact change was already rejected earlier in this "
+                    "conversation turn and will not be asked about again automatically.",
+                    tool_call_id=tc["id"],
+                )
+                for tc in last.tool_calls
+            ]
+            final_msg = AIMessage(
+                content="That action was already declined, so I won't ask again. Let me know if "
+                "there's something else you'd like to do."
+            )
+            return {"messages": cancel_messages + [final_msg]}
 
         changes = []
         for tc in destructive_calls:
@@ -444,13 +480,17 @@ def build_app(db: Optional[NoteDatabase] = None, checkpointer=None, llm=None):
             ToolMessage(content="CANCELLED: user did not approve this action.", tool_call_id=tc["id"])
             for tc in last.tool_calls
         ]
-        return {"messages": cancel_messages}
+        return {"messages": cancel_messages, "rejected_this_turn": list(already_rejected) + keys}
 
-    def route_after_human_review(state: AgentState) -> Literal["tools", "agent"]:
+    def route_after_human_review(state: AgentState) -> Literal["tools", "agent", "__end__"]:
         last = state["messages"][-1]
-        if isinstance(last, ToolMessage) and last.content.startswith("CANCELLED"):
-            return "agent"
-        return "tools"
+        if isinstance(last, AIMessage):
+            # The circuit breaker above ends with an AIMessage that has no
+            # tool_calls -- that's the "stop here" signal.
+            return "tools" if last.tool_calls else END
+        # A plain rejection (first time) ends on a ToolMessage -- let the
+        # agent see it and decide what to do next (e.g. try a different note).
+        return "agent"
 
     workflow = StateGraph(AgentState)
     workflow.add_node("classify_intent", classify_intent_node)
@@ -463,7 +503,9 @@ def build_app(db: Optional[NoteDatabase] = None, checkpointer=None, llm=None):
     workflow.add_conditional_edges(
         "agent", route_after_agent, {"human_review": "human_review", "tools": "tools", END: END}
     )
-    workflow.add_conditional_edges("human_review", route_after_human_review, {"tools": "tools", "agent": "agent"})
+    workflow.add_conditional_edges(
+        "human_review", route_after_human_review, {"tools": "tools", "agent": "agent", END: END}
+    )
     workflow.add_edge("tools", "agent")
 
     if checkpointer is None:

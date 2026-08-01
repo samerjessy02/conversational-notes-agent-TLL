@@ -19,6 +19,7 @@ not a byte-exact string match.
 | `test_bundled_multi_change_turn_all_or_nothing` | Two destructive tool calls proposed in the same turn produce ONE confirmation payload with both changes listed; a single approval applies both |
 | `test_rejecting_bundled_changes_applies_neither` | A single rejection cancels both bundled changes, not just one |
 | `test_sequential_proposals_each_get_their_own_interrupt` | Reproduces an observed real sequence: model proposes deleting note A, gets rejected, then on its own next turn proposes deleting note B too — note B must get its own independent interrupt; rejecting A must not implicitly approve or skip B |
+| `test_stubborn_model_repeating_rejected_proposal_is_hard_stopped` | Reproduces a second observed bug: the model re-proposes the SAME rejected note immediately after rejection. One "No" must be enough — the retry is auto-cancelled and the turn ends without a second interrupt, so the user is never forced to click "No" repeatedly for the same action. A genuinely new user message can still retry it later. |
 
 Run it any time with `python test_agent_smoke.py` (or `uv run python
 test_agent_smoke.py`) — no API key required, it stubs the LLM.

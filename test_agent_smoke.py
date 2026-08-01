@@ -247,6 +247,48 @@ def test_sequential_proposals_each_get_their_own_interrupt():
     print("PASS: approving the second, independent interrupt only affects note 5, not note 4")
 
 
+def test_stubborn_model_repeating_rejected_proposal_is_hard_stopped():
+    """Reproduces the reported bug: user says 'delete both X and Y', rejects
+    the first proposal, and the model -- instead of accepting the rejection
+    or moving on -- immediately re-proposes the EXACT SAME deletion again.
+    Before the circuit breaker, this could force the human to keep clicking
+    'No' indefinitely. Now: the second identical proposal must be
+    auto-cancelled and the turn must end WITHOUT a second interrupt --
+    i.e. app.invoke() returns cleanly with no "__interrupt__" the moment the
+    model retries a rejected target, no matter how many more times it tries."""
+    db = seeded_memory_db()
+    script = [
+        AIMessage(content="", tool_calls=[tc("delete_note", {"note_id": 4})]),
+        # Model stubbornly re-proposes the SAME note right after rejection,
+        # instead of accepting it or trying something else.
+        AIMessage(content="", tool_calls=[tc("delete_note", {"note_id": 4})]),
+    ]
+    llm = ScriptedChatModel(responses=script)
+    app, db = build_app(db=db, llm=llm, checkpointer=MemorySaver())
+    config = {"configurable": {"thread_id": "t6"}}
+
+    r1 = app.invoke({"messages": [HumanMessage(content="delete the API note")]}, config=config)
+    assert "__interrupt__" in r1
+
+    r2 = app.invoke(Command(resume={"approved": False}), config=config)
+    assert "__interrupt__" not in r2, (
+        "the circuit breaker must auto-cancel a repeat proposal and END the turn "
+        "instead of interrupting AGAIN and making the human reject a second time"
+    )
+    assert llm.idx == len(script), "the LLM must NOT be called a third time -- the breaker ends the turn directly"
+    assert db.get_note(4) is not None, "the note must still be untouched"
+    last_content = r2["messages"][-1].content
+    assert "won't ask again" in last_content or "already declined" in last_content
+    print(f"PASS: a repeated identical proposal is auto-cancelled and the turn ends immediately. Reply: {last_content!r}")
+
+    # A genuinely NEW user message must be able to try again -- the breaker
+    # is scoped to "this turn", not permanent.
+    llm.responses.append(AIMessage(content="", tool_calls=[tc("delete_note", {"note_id": 4})]))
+    r3 = app.invoke({"messages": [HumanMessage(content="ok actually delete the API note now")]}, config=config)
+    assert "__interrupt__" in r3, "a fresh user message must be able to propose the same note again"
+    print("PASS: a new user message resets the breaker and can propose the same note again")
+
+
 if __name__ == "__main__":
     test_intent_classifier()
     test_persistence_across_reopen()
@@ -256,4 +298,5 @@ if __name__ == "__main__":
     test_bundled_multi_change_turn_all_or_nothing()
     test_rejecting_bundled_changes_applies_neither()
     test_sequential_proposals_each_get_their_own_interrupt()
+    test_stubborn_model_repeating_rejected_proposal_is_hard_stopped()
     print("\nALL SMOKE TESTS PASSED")
