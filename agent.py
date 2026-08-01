@@ -1,43 +1,5 @@
 """
 Core agent: database, tools, intent classifier, and the LangGraph workflow.
-
-Both main.py (CLI) and ui.py (Streamlit) import build_app() from here so
-there's exactly one implementation instead of two copies drifting apart.
-
-DESIGN NOTES (read this before touching the graph)
-----------------------------------------------------------------------------
-1. Confirmation is a real human-in-the-loop pause, not text parsing. When
-   the agent proposes a modify_note/delete_note call, the graph routes to
-   human_review_node, which calls LangGraph's interrupt(). This freezes
-   execution -- app.invoke() returns immediately with a `__interrupt__` key
-   and a structured payload describing exactly what would change. Nothing
-   runs until the caller resumes with Command(resume={"approved": bool}).
-   The CLI prompts for y/n; the Streamlit UI renders actual Yes/No buttons.
-   Either way, the decision is a boolean the caller supplies explicitly --
-   there's no "the model decided this looked like a yes" step anymore.
-
-2. modify_note_tool and delete_note_tool mutate the database directly, same
-   as add_note_tool. That's safe now, specifically because by the time
-   ToolNode ever gets to run them, human_review_node has already gated the
-   call on interrupt()+approval. The tools themselves don't need to know
-   anything about confirmation -- the gate lives entirely in the graph's
-   routing, one level up.
-
-3. Because interrupt() genuinely blocks the graph, there's no need for a
-   confirmation queue anymore: the user (or the model) literally cannot
-   start a second turn while one destructive action is awaiting approval --
-   the graph is paused. The one edge case handled explicitly is a single
-   agent turn proposing MORE THAN ONE destructive tool call at once (e.g.
-   the model decides to delete note A and rename note B in the same
-   message): those are bundled into a single interrupt payload with a list
-   of changes, and approval/rejection applies to all of them together. This
-   keeps tool_call/tool_result ordering simple and avoids having to
-   reconstruct a partially-approved AIMessage (which is exactly the kind of
-   thing that trips up strict OpenAI-style tool-calling APIs like Groq's).
-
-4. Notes persist in SQLite (default: notes.db in the working directory,
-   overridable via NOTES_DB_PATH). Seed data is only inserted the first
-   time the file is created/empty.
 """
 import datetime
 import os
@@ -67,11 +29,6 @@ load_dotenv()
 class NoteDatabase:
     """Persistent note storage backed by SQLite.
 
-    Uses a single connection for the instance's lifetime (not one per
-    thread) with a lock around every statement. This app is a single-user
-    CLI/Streamlit prototype, not a high-concurrency service, so a lock is
-    simpler and safer than per-thread connections -- the latter would
-    silently give each thread its own isolated ":memory:" database.
     """
 
     def __init__(self, db_path: str = "notes.db"):
@@ -188,7 +145,7 @@ def make_seeded_db(db_path: Optional[str] = None) -> NoteDatabase:
 
 
 # =====================================================================
-# 2. INTENT CLASSIFIER (hint-only now -- confirmation no longer depends on it)
+# 2. INTENT CLASSIFIER 
 # =====================================================================
 _DELETE_RE = re.compile(r"\b(delete|remove|erase|trash|get rid of)\b", re.I)
 _MODIFY_RE = re.compile(r"\b(update|change|edit|modify|rename|correct|fix)\b", re.I)
@@ -201,8 +158,7 @@ Intent = Literal["delete", "modify", "create", "search", "chitchat"]
 def classify_intent(text: str) -> Intent:
     """Cheap, deterministic, regex-based intent tag for a user message. Used
     only as a soft hint injected into the system prompt -- the model can
-    ignore it. It is NOT involved in the confirmation flow anymore (see
-    human_review_node / interrupt() below for that)."""
+    ignore it."""
     t = text.strip()
     if _DELETE_RE.search(t):
         return "delete"
@@ -234,12 +190,6 @@ class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     last_intent: Optional[str]
     rejected_this_turn: List[str]
-    # "tool:note_id" keys the user has already said no to since their last
-    # actual chat message. Scoped to "this turn" because it's reset in
-    # classify_intent_node, which only runs when a NEW HumanMessage arrives
-    # -- a resumed interrupt never passes back through it. This is what lets
-    # the user retry later by just asking again, while preventing the model
-    # from re-proposing the identical rejected change in a loop right now.
 
 
 # =====================================================================

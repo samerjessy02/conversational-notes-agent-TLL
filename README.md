@@ -122,11 +122,3 @@ conversation only — notes persist independently).
 
 It's single-session by design (one fixed thread id, one shared DB) — good
 for local testing, not built for multiple concurrent users.
-
-## Known gaps
-
-- Single-user/single-session — one fixed `thread_id`, one shared DB connection.
-- SQLite with a single connection + a lock handles one user fine; it is not built for concurrent writers.
-- The intent classifier is a heuristic and will misfire on unusual phrasing — acceptable since it's advisory only now, not gating anything.
-- No audit log — a confirmed delete is just gone, no record of who approved it or when.
-- No auth — anyone with the URL/terminal has full read/write/delete access.
